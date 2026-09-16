@@ -1,0 +1,2377 @@
+## 1. 整体架构概览
+
+### 1.1 三层架构设计
+
+LangChain 采用清晰的分层架构，将抽象接口、具体实现和第三方集成分离：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            应用层 (用户代码)                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      langchain-classic (实现层)                              │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐        │
+│  │   chains/   │  │   agents/   │  │  retrievals │  │   memory/   │        │
+│  │  链式调用   │  │  Agent系统  │  │   检索器    │  │   记忆系统  │        │
+│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘        │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       langchain-core (抽象层)                                │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐        │
+│  │  runnables/ │  │  messages/  │  │language_models│  │   tools/   │        │
+│  │  LCEL核心   │  │  消息系统   │  │   模型抽象   │  │  工具系统  │        │
+│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘        │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                         │
+│  │ callbacks/  │  │output_parsers│  │  prompts/  │                         │
+│  │  回调系统   │  │  输出解析器  │  │  提示模板  │                         │
+│  └─────────────┘  └─────────────┘  └─────────────┘                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       partners (集成层)                                      │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐     │
+│  │  openai  │  │anthropic │  │  ollama  │  │  groq    │  │  ...     │     │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘     │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 核心设计理念
+
+**1. 抽象优先**：`langchain-core` 定义所有核心接口，不依赖任何第三方库
+
+- 位置：`e:\Framework\langchain\libs\core\langchain_core\`
+- 依赖极简：仅 pydantic、tenacity、typing-extensions 等
+
+**2. 组合优于继承**：通过 LCEL (LangChain Expression Language) 实现声明式组合
+
+- 使用 `|` 操作符链接组件：`prompt | llm | parser`
+- 自动获得同步/异步、批处理、流式处理能力
+
+**3. 统一调用协议**：所有组件都是 `Runnable`，具有一致的接口
+
+- `invoke()` - 单次调用
+- `batch()` - 批量调用
+- `stream()` - 流式调用
+- 对应的异步版本：`ainvoke()`, `abatch()`, `astream()`
+
+### 1.3 模块依赖关系
+
+```
+langchain-core (基础抽象)
+    │
+    ├── Runnable[Input, Output]     # 统一调用协议
+    ├── BaseMessage                 # 消息抽象
+    ├── BaseLanguageModel           # 模型抽象
+    ├── BaseTool                    # 工具抽象
+    ├── BaseCallbackHandler         # 回调抽象
+    └── BaseOutputParser            # 输出解析抽象
+          │
+          ▼
+langchain-classic (具体实现)
+    │
+    ├── Chain (继承 RunnableSerializable)
+    ├── AgentExecutor (组合 Agent + Tools)
+    ├── LLMChain (组合 Prompt + LLM + Parser)
+    └── RetrievalQA (组合 Retriever + Chain)
+          │
+          ▼
+partners (第三方集成)
+    │
+    ├── ChatOpenAI (实现 BaseChatModel)
+    ├── ChatAnthropic (实现 BaseChatModel)
+    └── ...
+```
+
+
+
+### 2.2 messages 模块 - 消息系统
+
+**位置**：`e:\Framework\langchain\libs\core\langchain_core\messages\`
+
+#### 2.2.1 消息类型体系
+
+```
+Serializable (Pydantic BaseModel)
+    │
+    └── BaseMessage
+            │
+            ├── HumanMessage     # 用户消息 (type="human")
+            │       └── HumanMessageChunk
+            │
+            ├── AIMessage        # AI 响应 (type="ai")
+            │       ├── tool_calls: list[ToolCall]      # 工具调用
+            │       ├── usage_metadata: UsageMetadata   # token 使用统计
+            │       └── AIMessageChunk
+            │
+            ├── SystemMessage    # 系统提示 (type="system")
+            │       └── SystemMessageChunk
+            │
+            ├── ToolMessage      # 工具执行结果 (type="tool")
+            │       ├── tool_call_id: str    # 关联的工具调用 ID
+            │       ├── artifact: Any        # 可选的额外数据
+            │       └── ToolMessageChunk
+            │
+            └── ChatMessage      # 自定义角色 (type="chat")
+                    ├── role: str
+                    └── ChatMessageChunk
+```
+
+#### 2.2.2 消息核心字段
+
+```python
+# base.py
+class BaseMessage(Serializable):
+    content: str | list[str | dict]  # 消息内容（支持多模态）
+    type: str                        # 消息类型标识
+    additional_kwargs: dict          # 额外元数据
+    response_metadata: dict          # 响应元数据（模型提供商特定）
+    name: str | None                 # 消息名称
+    id: str | None                   # 消息唯一 ID
+
+# ai.py
+class AIMessage(BaseMessage):
+    tool_calls: list[ToolCall] = []           # 工具调用请求
+    invalid_tool_calls: list[InvalidToolCall] = []  # 无效工具调用
+    usage_metadata: UsageMetadata | None = None     # token 使用统计
+
+# tool.py
+class ToolMessage(BaseMessage):
+    tool_call_id: str              # 关联的 tool_call ID
+    artifact: Any | None = None    # 额外数据（不发送给模型）
+    status: str | None = None      # 执行状态
+```
+
+#### 2.2.3 多模态内容支持
+
+```python
+# content.py - ContentBlock 类型定义
+ContentBlock = (
+    TextContentBlock           # {"type": "text", "text": "..."}
+    | ImageContentBlock        # {"type": "image", "url": "...", "mime_type": "..."}
+    | AudioContentBlock        # {"type": "audio", ...}
+    | VideoContentBlock        # {"type": "video", ...}
+    | ToolCall                 # {"type": "tool_call", "name": "...", "args": {...}}
+    | ...
+)
+
+# 使用示例
+message = HumanMessage(content=[
+    {"type": "text", "text": "What's in this image?"},
+    {"type": "image", "url": "https://example.com/image.png", "mime_type": "image/png"}
+])
+```
+
+---
+
+### 2.3 language_models 模块 - 模型抽象
+
+**位置**：`e:\Framework\langchain\libs\core\langchain_core\language_models\`
+
+#### 2.3.1 模型类继承体系
+
+```
+Runnable[LanguageModelInput, LanguageModelOutputVar]
+    │
+    └── RunnableSerializable
+            │
+            └── BaseLanguageModel[LanguageModelOutputVar] (ABC)
+                    │
+                    ├── BaseChatModel (ABC)    # 聊天模型
+                    │       │
+                    │       └── SimpleChatModel  # 简化实现
+                    │
+                    └── BaseLLM (ABC)          # 文本补全模型
+                            │
+                            └── LLM             # 简化实现
+```
+
+#### 2.3.2 BaseChatModel 核心设计
+
+```python
+# chat_models.py
+class BaseChatModel(BaseLanguageModel[AIMessage], ABC):
+    # 核心抽象方法 - 子类必须实现
+    @abstractmethod
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs
+    ) -> ChatResult:
+        """核心生成方法"""
+
+    # 可选的流式实现
+    def _stream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs
+    ) -> Iterator[ChatGenerationChunk]:
+        """流式生成 - 默认抛 NotImplementedError"""
+        raise NotImplementedError
+
+    # 公开方法 - 模板方法模式
+    def invoke(self, input: LanguageModelInput, config: ...) -> AIMessage:
+        """调用入口"""
+        config = ensure_config(config)
+        return self.generate_prompt(
+            [self._convert_input(input)],
+            ...
+        ).generations[0][0].message
+```
+
+#### 2.3.3 调用流程详解
+
+```
+用户调用 invoke(input)
+    │
+    ├── _convert_input(input) → PromptValue
+    │       ├── str → StringPromptValue
+    │       ├── list[BaseMessage] → ChatPromptValue
+    │       └── PromptValue → 直接返回
+    │
+    └── generate_prompt([prompt_value], ...)
+            │
+            ├── prompt.to_messages() → list[BaseMessage]
+            │
+            └── generate(messages, ...)
+                    │
+                    ├── CallbackManager.configure()  # 配置回调
+                    │
+                    ├── on_chat_model_start()  # 回调：开始
+                    │
+                    ├── _generate_with_cache()
+                    │       │
+                    │       ├── 检查缓存 → 命中则返回
+                    │       │
+                    │       ├── rate_limiter.acquire()  # 限流
+                    │       │
+                    │       ├── _should_stream() → 判断是否流式
+                    │       │       │
+                    │       │       └── [流式] _stream() → 累积 chunks
+                    │       │       │
+                    │       │       └── [非流式] _generate()
+                    │       │
+                    │       └── 更新缓存
+                    │
+                    └── on_llm_end()  # 回调：结束
+```
+
+---
+
+### 2.4 tools 模块 - 工具系统
+
+**位置**：`e:\Framework\langchain\libs\core\langchain_core\tools\`
+
+#### 2.4.1 工具类继承体系
+
+```
+RunnableSerializable
+    │
+    └── BaseTool
+            │
+            ├── Tool              # 简单工具（单输入）
+            │       func: Callable    # 执行函数
+            │
+            └── StructuredTool    # 结构化工具（多输入）
+                    func: Callable
+                    args_schema: Type[BaseModel]  # 参数 Schema
+```
+
+#### 2.4.2 BaseTool 核心设计
+
+```python
+# base.py
+class BaseTool(RunnableSerializable[str | dict, str | dict], ABC):
+    name: str                        # 工具名称（唯一标识）
+    description: str                 # 工具描述（供 Agent 选择）
+    args_schema: Type[BaseModel]     # 参数 Schema
+    return_direct: bool = False      # 是否直接返回（跳过 Agent 循环）
+    handle_tool_error: ...           # 错误处理策略
+
+    @abstractmethod
+    def _run(self, *args, **kwargs) -> str | dict:
+        """核心执行方法 - 子类实现"""
+
+    def run(self, tool_input: str | dict, ...) -> str | dict:
+        """公开执行方法"""
+        # 1. 配置回调
+        callback_manager = CallbackManager.configure(...)
+        run_manager = callback_manager.on_tool_start(...)
+
+        try:
+            # 2. 参数验证
+            args, kwargs = self._to_args_and_kwargs(tool_input)
+
+            # 3. 执行核心逻辑
+            result = self._run(*args, **kwargs)
+
+            # 4. 格式化输出
+            output = self._format_output(result, tool_call_id)
+
+        except ToolException as e:
+            # 5. 错误处理
+            run_manager.on_tool_error(e)
+            if self.handle_tool_error:
+                output = self._handle_error(e)
+            else:
+                raise
+
+        run_manager.on_tool_end(output)
+        return output
+```
+
+#### 2.4.3 工具创建方式
+
+```python
+# 方式1: @tool 装饰器（推荐）
+from langchain_core.tools import tool
+
+@tool
+def search(query: str) -> str:
+    """Search for information about a query."""  # docstring 作为 description
+    return f"Results for: {query}"
+
+# 方式2: StructuredTool.from_function
+from langchain_core.tools import StructuredTool
+from pydantic import BaseModel
+
+class SearchInput(BaseModel):
+    query: str
+    limit: int = 10
+
+tool = StructuredTool.from_function(
+    func=search,
+    name="search",
+    description="Search for information",
+    args_schema=SearchInput
+)
+```
+
+#### 2.4.4 参数注入机制
+
+```python
+# base.py
+class InjectedToolArg:
+    """运行时注入的参数，不暴露给 LLM"""
+    pass
+
+class InjectedToolCallId(InjectedToolArg):
+    """注入 tool_call_id"""
+    pass
+
+# 使用示例
+from typing import Annotated
+
+@tool
+def my_tool(
+    x: int,                                    # 普通参数，暴露给 LLM
+    tool_call_id: Annotated[str, InjectedToolCallId]  # 注入参数
+) -> str:
+    return f"x={x}, id={tool_call_id}"
+
+# tool.tool_call_schema 只包含 x 参数
+# 运行时 tool_call_id 自动注入
+```
+
+---
+
+### 2.5 callbacks 模块 - 回调系统
+
+**位置**：`e:\Framework\langchain\libs\core\langchain_core\callbacks\`
+
+#### 2.5.1 回调类继承体系
+
+```
+Mixin 层（按事件类型组织）
+    ├── LLMManagerMixin      # on_llm_start, on_llm_end, on_llm_new_token
+    ├── ChainManagerMixin    # on_chain_start, on_chain_end
+    ├── ToolManagerMixin     # on_tool_start, on_tool_end
+    ├── RetrieverManagerMixin # on_retriever_start, on_retriever_end
+    └── CallbackManagerMixin  # on_callback, ...
+
+BaseCallbackHandler (组合所有 Mixin)
+    │
+    ├── StdOutCallbackHandler       # 控制台输出
+    ├── StreamingStdOutCallbackHandler  # 流式输出
+    ├── FileCallbackHandler         # 文件输出
+    └── LangChainTracer             # LangSmith 追踪
+
+BaseCallbackManager
+    │
+    ├── CallbackManager (同步)
+    │       ├── CallbackManagerForLLMRun
+    │       ├── CallbackManagerForChainRun
+    │       └── CallbackManagerForToolRun
+    │
+    └── AsyncCallbackManager (异步)
+```
+
+#### 2.5.2 事件触发流程
+
+```python
+# manager.py - 事件处理
+def handle_event(
+    handlers: list[BaseCallbackHandler],
+    event_name: str,           # 如 "on_llm_start"
+    ignore_condition_name: str, # 如 "ignore_llm"
+    *args, **kwargs
+) -> None:
+    for handler in handlers:
+        # 检查是否忽略
+        if not getattr(handler, ignore_condition_name):
+            try:
+                # 调用对应方法
+                getattr(handler, event_name)(*args, **kwargs)
+            except NotImplementedError:
+                # 方法回退（如 on_chat_model_start → on_llm_start）
+                ...
+
+# 使用示例
+class MyHandler(BaseCallbackHandler):
+    def on_llm_start(self, serialized, prompts, **kwargs):
+        print(f"LLM started with {len(prompts)} prompts")
+
+    def on_llm_new_token(self, token, **kwargs):
+        print(f"New token: {token}")
+
+    def on_llm_end(self, response, **kwargs):
+        print(f"LLM ended")
+
+# 配置
+llm = ChatOpenAI(callbacks=[MyHandler()])
+```
+
+
+## 3. 数据流追踪
+
+### 3.1 典型 LLM 调用链
+
+**场景**：用户输入 → Prompt 模板 → LLM → 输出解析器 → 结果
+
+```python
+# 代码
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_core.output_parsers import StrOutputParser
+
+chain = ChatPromptTemplate.from_template("Tell me a joke about {topic}") | ChatOpenAI() | StrOutputParser()
+result = chain.invoke({"topic": "cats"})
+```
+
+**数据流追踪**：
+
+```
+Step 1: 用户输入
+    input = {"topic": "cats"}
+            │
+            ▼
+Step 2: ChatPromptTemplate.invoke({"topic": "cats"})
+    │
+    ├── _convert_input({"topic": "cats"}) → 确认是 dict
+    │
+    └── format_prompt({"topic": "cats"})
+            │
+            └── template.format(**{"topic": "cats"})
+                    → "Tell me a joke about cats"
+            │
+            └── ChatPromptValue(messages=[
+                    HumanMessage(content="Tell me a joke about cats")
+                ])
+            │
+            ▼
+Step 3: ChatOpenAI.invoke(ChatPromptValue)
+    │
+    ├── prompt_value.to_messages() → [HumanMessage(...)]
+    │
+    └── generate([HumanMessage(...)])
+            │
+            ├── CallbackManager.configure()
+            │
+            ├── on_chat_model_start()  # 回调
+            │
+            ├── _generate([HumanMessage(...)])
+            │       │
+            │       └── 调用 OpenAI API
+            │               POST /v1/chat/completions
+            │               {
+            │                   "model": "gpt-4",
+            │                   "messages": [{"role": "user", "content": ...}]
+            │               }
+            │
+            └── on_llm_end()  # 回调
+            │
+            └── ChatResult(generations=[[
+                    ChatGeneration(message=AIMessage(
+                        content="Why don't cats play poker?...",
+                        usage_metadata={...}
+                    ))
+                ]])
+            │
+            ▼
+Step 4: StrOutputParser.invoke(AIMessage)
+    │
+    └── parse(AIMessage.content)
+            → "Why don't cats play poker?..."
+            │
+            ▼
+Step 5: 返回结果
+    result = "Why don't cats play poker?..."
+```
+
+### 3.2 Agent 执行循环
+
+**场景**：ReAct Agent 执行工具调用
+
+```python
+from langchain.agents import create_react_agent, AgentExecutor
+
+agent = create_react_agent(llm, tools, prompt)
+agent_executor = AgentExecutor(agent=agent, tools=tools)
+result = agent_executor.invoke({"input": "What is the weather in Tokyo?"})
+```
+
+**执行循环**：
+
+```
+AgentExecutor._call({"input": "What is the weather in Tokyo?"})
+    │
+    ├── 初始化
+    │   intermediate_steps = []
+    │   iterations = 0
+    │
+    └── while _should_continue():
+            │
+            ├── Iteration 1
+            │   │
+            │   ├── agent.plan(intermediate_steps)
+            │   │   │
+            │   │   ├── 构建暂存区: scratchpad = ""
+            │   │   │
+            │   │   ├── 调用 LLM: prompt | llm
+            │   │   │
+            │   │   └── 解析输出:
+            │   │       "Thought: I need to search for weather
+            │   │        Action: search
+            │   │        Action Input: Tokyo"
+            │   │
+            │   │   → AgentAction(tool="search", tool_input="Tokyo", log="...")
+            │   │
+            │   └── tool.run("Tokyo")
+            │           → "Tokyo: 25°C, sunny"
+            │
+            │   intermediate_steps = [(AgentAction(...), "Tokyo: 25°C, sunny")]
+            │   iterations += 1
+            │
+            ├── Iteration 2
+            │   │
+            │   ├── agent.plan(intermediate_steps)
+            │   │   │
+            │   │   ├── 构建暂存区:
+            │   │   │   scratchpad = """
+            │   │   │   Thought: I need to search for weather
+            │   │   │   Action: search
+            │   │   │   Action Input: Tokyo
+            │   │   │   Observation: Tokyo: 25°C, sunny
+            │   │   │   """
+            │   │   │
+            │   │   └── 调用 LLM:
+            │   │       "Thought: I have the answer
+            │   │        Final Answer: The weather in Tokyo is 25°C and sunny"
+            │   │
+            │   │   → AgentFinish(return_values={"output": "The weather in Tokyo..."})
+            │   │
+            │   └── 返回结果
+            │
+            └── 返回
+                {"output": "The weather in Tokyo is 25°C and sunny",
+                 "intermediate_steps": [...]}
+```
+
+
+
+
+
+### `model.invoke("Hello")` 做了什么？
+
+**设计问题：** 一个字符串怎么变成API请求？中间经过哪些层？
+
+**设计方案：五层调用链，每层一个职责**
+
+```
+invoke              → "入口层"：输入适配、配置合并
+    ↓
+generate_prompt     → "转换层"：PromptValue → 消息列表
+    ↓
+generate            → "管理层"：回调管理、错误处理
+    ↓
+_generate_with_cache → "缓存层"：透明缓存
+    ↓
+_generate           → "实现层"：子类实现，真正调用API
+```
+
+**为什么分这么多层？** 模板方法模式——基类定义调用骨架，子类只实现最后一层。
+
+**每层做了什么：**
+
+**第一层 `invoke`：输入适配**
+
+用户可以传入三种格式的输入：
+
+- 字符串 `"Hello"` → 包装成 `StringPromptValue`
+- 消息列表 `[HumanMessage("Hello")]` → 包装成 `ChatPromptValue`
+- `PromptValue` 对象 → 直接返回
+
+这一步统一了输入格式，后续层不需要关心用户传的是什么类型。
+
+**第二层 `generate_prompt`：格式转换**
+
+把 `PromptValue` 转成消息列表（`[HumanMessage("Hello")]`），交给 `generate`。
+
+**第三层 `generate`：管理层**
+
+设置回调管理器（callback manager），处理错误，支持批量调用。
+
+**第四层 `_generate_with_cache`：缓存层**
+
+检查缓存：用"序列化消息 + 模型参数"作为缓存键，如果命中直接返回，不调用API。未命中则调用 `_generate`，然后把结果存入缓存。
+
+**第五层 `_generate`：实现层**
+
+这是唯一需要子类实现的方法。`ChatOpenAI` 在这里把LangChain消息格式转换成OpenAI API格式，调用OpenAI SDK，再把响应转回 `AIMessage`。
+
+### 3. 数据流动过程
+
+```
+"Hello" (用户传入的字符串)
+    ↓ _convert_input：统一适配
+HumanMessage(content="Hello")  (LangChain内部消息格式)
+    ↓ _convert_message_to_dict：格式转换
+{"role": "user", "content": "Hello"}  (OpenAI API格式)
+    ↓ OpenAI SDK调用
+AIMessage(content="Hi!")  (LangChain内部消息格式)
+```
+## 第三部分：BaseChatModel — 模板方法模式的教科书
+
+**核心问题：** 为什么模型调用要分这么多层？直接调API不行吗？
+
+### 1. 设计问题：统一模型调用接口
+
+OpenAI、Anthropic、Ollama……每个Provider的API完全不同。但用户只想写 `model.invoke("Hello")`，不想关心底层用的是哪个SDK。
+
+**设计答案：** 模板方法模式——基类定义调用骨架，子类只实现最后一步。
+
+### 2. 五层调用链的设计意图
+
+```
+invoke              → "入口层"：输入适配、配置合并
+    ↓
+generate_prompt     → "转换层"：PromptValue → 消息列表
+    ↓
+generate            → "管理层"：回调管理、错误处理
+    ↓
+_generate_with_cache → "缓存层"：透明缓存
+    ↓
+_generate           → "实现层"：子类实现，真正调用API
+```
+
+**为什么要分这么多层？**
+
+- **关注点分离：** 每层只做一件事。缓存逻辑不需要知道OpenAI的API格式，输入适配不需要关心缓存策略
+- **子类最小化：** ChatOpenAI只需要实现 `_generate`，自动获得缓存、回调、错误处理等能力
+- **扩展点明确：** 想加缓存？改 `_generate_with_cache`。想改输入格式？改 `_convert_input`。不影响其他层
+
+### 3. `_convert_input` 的适配器模式
+
+用户可以传入三种输入：
+
+- 字符串 `"Hello"` → 包装成 `StringPromptValue`
+- 消息列表 `[HumanMessage(...)]` → 包装成 `ChatPromptValue`
+- `PromptValue` 对象 → 直接返回
+
+**为什么需要PromptValue？** 因为Prompt模板填充变量后产生的是PromptValue，不是消息列表。PromptValue是"模型输入的最终形态"，它知道怎么把自己转成消息列表。这个中间层让Prompt模板和模型调用解耦。
+
+### 4. 缓存机制的设计
+
+```python
+def _generate_with_cache(self, messages, ...):
+    # 缓存键 = 序列化消息 + 模型参数字符串
+    llm_string = self._get_llm_string(stop=stop, **kwargs)
+    prompt = dumps(normalized_messages)
+  
+    # 查找缓存
+    cache_val = llm_cache.lookup(prompt, llm_string)
+    if cache_val:
+        return ChatResult(generations=cache_val)  # 命中，直接返回
+  
+    # 未命中，调用API
+    result = self._generate(messages, stop=stop, **kwargs)
+  
+    # 更新缓存
+    llm_cache.update(prompt, llm_string, result.generations)
+    return result
+```
+
+**设计要点：**
+
+- **缓存键包含消息内容和模型参数：** 相同消息 + 不同temperature = 不同缓存条目
+- **消息的 `id` 字段被清空：** 避免因Provider生成的不同id导致缓存失效
+- **缓存是透明的：** 对调用方完全隐藏，命中与否都不影响返回值格式
+- **速率限制器在缓存检查之后：** 缓存命中不需要限速，只有真正调用API时才限速
+
+### 5. bind_tools 的不可变设计
+
+```python
+def bind_tools(self, tools, ...):
+    formatted_tools = [convert_to_openai_tool(t) for t in tools]
+    return self.bind(tools=formatted_tools, ...)
+```
+
+`bind` 返回一个新的 `RunnableBinding`，原模型不变。这遵循不可变原则：
+
+- 原模型可以继续被其他地方使用
+- 绑定tools的模型可以继续组合（如 `.with_retry()`）
+- 每次bind都是独立的配置，互不干扰
+
+### 6. _generate 是唯一的抽象方法
+
+```python
+@abstractmethod
+def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+    """Generate the result."""
+```
+
+子类（如 ChatOpenAI、ChatAnthropic）必须实现这个方法。它接收标准的LangChain消息列表，返回标准的 `ChatResult`。所有Provider特定的逻辑（API格式、认证、错误处理）都封装在这里。
+
+**设计原则：** 基类定义"做什么"（调用链），子类定义"怎么做"（API调用）。
+**设计启示：** 整个框架的核心设计思想是"分层适配"——每一层解决一个问题，层与层之间通过统一接口连接。换Provider只需要改最后一层（`_generate`），前面四层完全复用。
+* **核心思想** ： **分层单一职责** ，每层只负责一件事，职责拆分清晰、互不越界。
+* **层间约定** ：靠**统一接口**做隔离，上层不依赖下层具体实现，只依赖接口协议。
+* **换 Provider 优势** ：大模型 / 接口服务商切换时， **只替换最底层的 _generate 实现** ，前面四层业务逻辑、流程、封装完全不用改、直接复用。
+* **本质价值** ： **解耦、易扩展、低维护** ，新增 / 切换供应商只插拔底层，不用动整体框架和上层逻辑。
+## 第八部分：Provider适配 — 一层之差的统一
+
+**核心问题：** ChatOpenAI和ChatAnthropic有什么不同？为什么每个Provider都要实现 `_generate`？
+
+### 1. 设计问题：API差异无处不在
+
+| 差异点   | OpenAI           | Anthropic              |
+| -------- | ---------------- | ---------------------- |
+| API端点  | chat/completions | messages               |
+| 消息格式 | dict列表         | content blocks         |
+| 工具格式 | tool_calls字段   | tool_use content block |
+| 流式格式 | SSE chunks       | SSE events             |
+| 系统提示 | system message   | system参数             |
+
+**设计答案：** 所有差异封装在 `_generate` 一个方法里。基类处理一切共同逻辑，子类只负责"把LangChain消息转成Provider格式，调用API，把响应转回LangChain格式"。
+
+### 2. ChatOpenAI._generate 的三步走
+
+```python
+def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+    # 第一步：构建请求payload
+    payload = self._get_request_payload(messages, stop=stop, **kwargs)
+  
+    # 第二步：调用OpenAI SDK
+    raw_response = self.client.with_raw_response.create(**payload)
+    response = raw_response.parse()
+  
+    # 第三步：解析响应，返回ChatResult
+    return _construct_lc_result(response, ...)
+```
+
+**消息格式转换在哪做？** 在 `_get_request_payload` 里：
+
+```python
+payload["messages"] = [
+    _convert_message_to_dict(m) for m in messages
+]
+```
+
+`_convert_message_to_dict` 根据消息类型设置role：
+
+- `HumanMessage` → `{"role": "user", "content": "..."}`
+- `AIMessage` → `{"role": "assistant", "content": "...", "tool_calls": [...]}`
+- `SystemMessage` → `{"role": "system", "content": "..."}`
+- `ToolMessage` → `{"role": "tool", "tool_call_id": "...", "content": "..."}`
+
+### 3. 为什么用模板方法模式？
+
+```
+BaseChatModel (定义骨架)
+    ├── ChatOpenAI    (实现 _generate)
+    ├── ChatAnthropic (实现 _generate)
+    ├── ChatOllama    (实现 _generate)
+    └── ...           (其他Provider)
+```
+
+**好处：**
+
+- **新增Provider只需要实现一个方法：** 不需要理解缓存、回调、错误处理等复杂逻辑
+- **缓存、回调、错误处理、批量支持等能力自动获得：** 基类已经实现了
+- **基类的改进所有Provider立即受益：** 比如新增了缓存策略，所有Provider都能用
+
+### 4. Provider之间的关键差异
+
+**OpenAI的特点：**
+
+- 支持两种API：chat/completions（传统）和responses（新）
+- 工具调用通过 `tool_calls` 字段返回
+- 流式响应是SSE格式的chunks
+
+**Anthropic的特点：**
+
+- 系统提示是单独的参数，不是消息列表的一部分
+- 工具调用是content block的一种类型
+- 流式响应的事件格式不同
+
+**这些差异都封装在各自的 `_generate` 和辅助方法里，对用户完全透明。**
+
+### 5. 构造函数的设计
+
+每个Provider的构造函数处理自己的配置：
+
+```python
+# OpenAI
+ChatOpenAI(model="gpt-4o", api_key="sk-xxx", temperature=0.7)
+
+# Anthropic
+ChatAnthropic(model="claude-3-opus-20240229", api_key="sk-ant-xxx", temperature=0.7)
+```
+
+用户看到的接口是一样的（model、temperature等），但底层的SDK调用完全不同。这就是统一接口的价值。
+
+
+### 2. 为什么用 `|` 操作符而不是方法调用？
+
+**源码证据**：`langchain_core/runnables/base.py` 第 622-641 行
+
+```python
+def __or__(self, other) -> RunnableSequence:
+    return RunnableSequence(self, coerce_to_runnable(other))
+```
+
+**更简单的方案**：用构造函数或方法调用。
+
+```python
+chain = RunnableSequence([prompt, llm, parser])   # 构造函数
+chain = prompt.pipe(llm).pipe(parser)              # 方法调用
+```
+
+**为什么用 `|` 操作符**：
+
+`|` 是 Unix 管道符号。程序员一看就懂「数据从左流到右」。对比：
+
+### 3. 为什么配置要用 ContextVar 隐式传递？
+
+**源码证据**：`langchain_core/runnables/config.py` 第 166 行
+
+```python
+var_child_runnable_config: ContextVar[RunnableConfig | None] = ContextVar(
+    "child_runnable_config", default=None
+)
+```
+
+**更简单的方案**：每一层都显式传递 config 参数。
+
+```python
+def outer(input, config):
+    return middle(input, config)
+
+def middle(input, config):
+    return inner(input, config)
+
+def inner(input, config):
+    return llm.invoke(input, config)
+```
+
+**如果不用 ContextVar**：
+
+用户调用 `chain.invoke(input, config={"tags": ["experiment"]})` 时，内部每一层都要传 config。如果链有 5 层深，5 个函数签名都要加 config 参数。任何一个中间层忘了传，配置就断了。
+
+**用 ContextVar 后**：
+
+`config.py` 第 247-300 行的 `ensure_config` 函数：
+
+```python
+def ensure_config(config: RunnableConfig | None) -> RunnableConfig:
+    if config is not None:
+        return config
+    parent_config = var_child_runnable_config.get()  # 自动从 ContextVar 获取
+    if parent_config is not None:
+        return copy(parent_config)
+    return get_default_config()
+```
+
+中间层不需要知道 config 的存在，需要时自动获取。
+
+**代价**：
+
+1. 隐式依赖：函数签名看不出它依赖 config
+2. 调试困难：config 从哪来的？追踪 ContextVar 需要理解 Python 的 context 机制
+3. 并发复杂：每个协程有独立的 context，需要理解 `copy_context()` 的行为
+
+---
+
+### 4. 为什么 Tool 要继承 Runnable？
+
+**源码证据**：`langchain_core/tools/base.py` 第 48-54 行
+
+```python
+from langchain_core.runnables import (
+    RunnableConfig,
+    RunnableSerializable,
+    ensure_config,
+    patch_config,
+    run_in_executor,
+)
+```
+
+BaseTool 继承了 `RunnableSerializable`，所以 Tool 也是一个 Runnable。
+
+**更简单的方案**：Tool 独立设计，不继承 Runnable。
+
+```python
+class BaseTool:  # 不继承 Runnable
+    def run(self, input) -> str: ...
+```
+
+**如果独立设计**：
+
+```python
+# 问题1: Tool 无法用 | 组合
+tool | llm  # 报错，Tool 没有 __or__
+
+# 问题2: Agent 内部要特殊处理
+class AgentExecutor:
+    def _perform_action(self, action):
+        if isinstance(action.tool, BaseTool):
+            result = action.tool.run(...)
+        elif isinstance(action.tool, Runnable):
+            result = action.tool.invoke(...)
+        # 需要分支处理
+```
+
+**继承 Runnable 后**：
+
+```python
+tool.invoke(input)       # 统一调用
+tool.batch([...])        # 自动获得批量
+tool | llm               # 可以组合
+```
+
+Agent 内部统一用 `invoke()` 调用，不需要分支。
+
+**代价**：
+
+Tool 类变得复杂，继承了可能不需要的方法（比如 `batch`、`stream`）。类型标注 `RunnableSerializable[str | dict, str | dict]` 不够精确。
+
+---
+
+### 5. 为什么 BaseChatModel 用模板方法模式？
+
+**源码证据**：`langchain_core/language_models/chat_models.py` 第 2085-2090 行
+
+```python
+@abstractmethod
+def _generate(
+    self,
+    messages: list[BaseMessage],
+    stop: list[str] | None = None,
+    run_manager: CallbackManagerForLLMRun | None = None,
+    **kwargs: Any,
+) -> ChatResult:
+```
+
+**更简单的方案**：让每个模型实现完整的 `invoke` 方法。
+
+```python
+class ChatOpenAI(BaseChatModel):
+    def invoke(self, input, config):
+        # 从头实现：配置处理、回调、缓存、限流、流式判断、API调用、错误处理...
+        config = ensure_config(config)
+        callback_manager = CallbackManager.configure(...)
+        run_manager = callback_manager.on_chat_model_start(...)
+        # ... 200 行代码
+```
+
+**如果用更简单的方案**：
+
+每个模型（OpenAI、Anthropic、Ollama）都要重复写配置处理、回调触发、缓存检查、限流逻辑。这些代码是相同的，只有 API 调用部分不同。
+
+**用模板方法后**：
+
+`chat_models.py` 第 1767-1810 行的 `_generate_with_cache` 方法：
+
+```python
+def _generate_with_cache(self, messages, stop, run_manager, **kwargs):
+    llm_cache = self.cache if isinstance(self.cache, BaseCache) else get_llm_cache()
+    if check_cache:
+        cache_val = llm_cache.lookup(prompt, llm_string)
+        if isinstance(cache_val, list):
+            return ChatResult(generations=cache_val)  # 缓存命中
+
+    if self.rate_limiter:
+        self.rate_limiter.acquire(blocking=True)  # 限流
+
+    if self._should_stream(...):
+        # 流式处理
+        for chunk in self._stream(messages, stop=stop, **kwargs): ...
+    else:
+        result = self._generate(messages, stop=stop, run_manager=run_manager, **kwargs)  # 调用子类
+```
+
+子类只需实现 `_generate()`，框架自动处理缓存、限流、流式判断、回调。
+
+**代价**：
+
+子类无法控制缓存逻辑、限流逻辑的细节。如果某个模型有特殊的缓存需求，需要覆盖整个 `_generate_with_cache`。
+
+---
+
+### 6. 为什么回调系统用 Mixin 而不是单一基类？
+
+**源码证据**：`langchain_core/callbacks/base.py`
+
+```python
+class LLMManagerMixin:
+    def on_llm_start(self, ...): pass
+    def on_llm_end(self, ...): pass
+
+class ChainManagerMixin:
+    def on_chain_start(self, ...): pass
+    def on_chain_end(self, ...): pass
+
+class BaseCallbackHandler(LLMManagerMixin, ChainManagerMixin, ToolManagerMixin, ...):
+    ...
+```
+
+**更简单的方案**：单一基类，所有方法放在一起。
+
+```python
+class BaseCallbackHandler:
+    def on_llm_start(self, ...): pass
+    def on_llm_end(self, ...): pass
+    def on_chain_start(self, ...): pass
+    def on_chain_end(self, ...): pass
+    def on_tool_start(self, ...): pass
+    # ... 20+ 个方法
+```
+
+**如果用单一基类**：
+
+用户只想监听 LLM 事件，但必须实现（或至少知道）所有 20+ 个方法。文件很长，相关方法散落各处。
+
+**用 Mixin 后**：
+
+用户只想监听 LLM 事件，只需看 `LLMManagerMixin` 的代码。相关方法放在一起，一目了然。
+
+**代价**：
+
+多重继承的复杂性。MRO（Method Resolution Order）可能带来意外行为。Python 的 MRO 是 C3 线性化，如果 Mixin 之间有同名方法，行为可能不符合预期。
+
+---
+
+### 7. 为什么消息类型要分成 HumanMessage、AIMessage、ToolMessage？
+
+**源码证据**：`langchain_core/messages/ai.py`
+
+```python
+class AIMessage(BaseMessage):
+    tool_calls: list[ToolCall] = []
+    invalid_tool_calls: list[InvalidToolCall] = []
+    usage_metadata: UsageMetadata | None = None
+```
+
+`langchain_core/messages/tool.py`：
+
+```python
+class ToolMessage(BaseMessage):
+    tool_call_id: str
+    artifact: Any | None = None
+    status: str | None = None
+```
+
+**更简单的方案**：一个 Message 类，用 role 字段区分。
+
+```python
+class Message:
+    role: str  # "human", "ai", "system", "tool"
+    content: str
+    tool_calls: list | None  # 只有 AI 用
+    tool_call_id: str | None  # 只有 Tool 用
+```
+
+**如果用一个类**：
+
+```python
+# 问题1: 字段语义不清
+msg = Message(role="ai", content="...", tool_calls=[...], tool_call_id=None)
+# tool_call_id 是 None，但它存在于 Message 类上，IDE 会提示它
+
+# 问题2: 类型检查困难
+def process(msg: Message):
+    if msg.role == "ai":
+        for tc in msg.tool_calls:  # IDE 不知道 tool_calls 是否为 None
+            ...
+```
+
+**分开后**：
+
+```python
+# 类型安全
+def process(msg: AIMessage):
+    for tc in msg.tool_calls:  # IDE 知道这个字段一定存在
+        ...
+```
+
+**代价**：
+
+类数量多。需要理解每种消息类型的区别。类型转换（如 `HumanMessage` → `BaseMessage`）需要理解继承关系。
+
+---
+
+### 8. 为什么要有 coerce_to_runnable 这个工厂函数？
+
+**源码证据**：`langchain_core/runnables/base.py` 第 6257-6277 行
+
+```python
+def coerce_to_runnable(thing: RunnableLike) -> Runnable[Input, Output]:
+    if isinstance(thing, Runnable):
+        return thing
+    if is_async_generator(thing) or inspect.isgeneratorfunction(thing):
+        return RunnableGenerator(thing)
+    if callable(thing):
+        return RunnableLambda(cast("Callable[[Input], Output]", thing))
+    if isinstance(thing, dict):
+        return cast("Runnable[Input, Output]", RunnableParallel(thing))
+```
+
+**更简单的方案**：要求用户显式包装。
+
+```python
+chain = RunnableLambda(lambda x: x + 1) | RunnableLambda(lambda x: x * 2)
+```
+
+**如果要求显式包装**：
+
+```python
+# 用户想写
+chain = prompt | llm | (lambda x: x.upper())
+
+# 但必须写
+chain = prompt | llm | RunnableLambda(lambda x: x.upper())
+
+# 更糟的是，dict 也不能直接用
+chain = prompt | {"result": llm, "metadata": metadata_parser}
+# 必须写
+chain = prompt | RunnableParallel({"result": llm, "metadata": metadata_parser})
+```
+
+**有了 coerce_to_runnable 后**：
+
+`__or__` 操作符内部调用 `coerce_to_runnable`，自动把函数转成 `RunnableLambda`，把 dict 转成 `RunnableParallel`。用户可以写最自然的代码。
+
+**代价**：
+
+隐式转换。用户传一个函数进去，不会报错，但报错时看到的是 `RunnableLambda`，不是直观的代码结构。调试时需要多想一步。
+
+
+
+
+```python
+chain = prompt.pipe(llm).pipe(parser)   # 方法调式：动词多，噪音大
+chain = prompt | llm | parser           # 操作符：只剩数据流本身
+```
+
+**代价**：
+
+1. 隐式行为：`|` 会自动调用 `coerce_to_runnable()`，把函数转成 RunnableLambda。用户传一个 lambda 进去，不会报错，但报错时看到的是 `RunnableSequence`，不是直观的代码结构。
+2. IDE 自动补全不如方法调用友好。
+
+**如果不这么设计**：
+
+用户可能写出这种代码：
+
+```python
+chain = RunnableSequence(first=prompt, middle=[llm], last=parser)
+```
+
+参数名 `first/middle/last` 很奇怪，为什么不是 list？而且每次组合都要写类名。
+
+## 第九部分：调试技巧 — 看见框架的内部世界
+
+**核心问题：** 怎么观察 `model.invoke("Hello")` 内部到底发生了什么？
+
+### 1. 启用调试日志
+
+```python
+from langchain_core.globals import set_debug, set_verbose
+
+set_debug(True)   # 最详细的日志：每一步的输入输出、回调事件
+set_verbose(True)  # 详细日志：主要调用步骤
+```
+
+开启后，控制台会输出：
+
+- 每个Runnable的输入和输出
+- 回调事件（on_chain_start, on_chain_end, on_chain_error）
+- 缓存命中/未命中
+- API请求和响应
+
+### 2. 回调系统
+
+LangChain的回调系统是观察框架内部的窗口：
+
+```python
+from langchain_core.callbacks import BaseCallbackHandler
+
+class MyHandler(BaseCallbackHandler):
+    def on_chain_start(self, serialized, inputs, **kwargs):
+        print(f"链条开始: {inputs}")
+  
+    def on_chain_end(self, outputs, **kwargs):
+        print(f"链条结束: {outputs}")
+  
+    def on_llm_start(self, serialized, prompts, **kwargs):
+        print(f"模型调用: {prompts}")
+  
+    def on_llm_end(self, response, **kwargs):
+        print(f"模型响应: {response}")
+
+model.invoke("Hello", config={"callbacks": [MyHandler()]})
+```
+
+**回调的生命周期：**
+
+```
+on_chain_start → on_llm_start → on_llm_end → on_chain_end
+                ↘ on_chain_error (如果出错)
+```
+
+回调系统是层级化的：链条（chain）的回调管理器包含模型（llm）的回调管理器。每个层级的事件都会向上冒泡。
+
+### 3. LangSmith集成
+
+LangSmith是LangChain的可视化调试平台。配置环境变量后，所有调用自动上报：
+
+```bash
+export LANGSMITH_API_KEY=xxx
+export LANGSMITH_TRACING=true
+```
+
+在LangSmith面板上可以看到：
+
+- 完整的调用链（哪些Runnable被调用，顺序是什么）
+- 每一步的输入输出
+- Token用量和延迟
+- 错误堆栈
+
+### 4. 调试Agent
+
+Agent的调试比普通调用复杂，因为涉及循环和工具执行。除了上述方法，还可以：
+
+- **`debug=True`：** `create_agent(..., debug=True)` 开启图执行的详细日志
+- **`interrupt_before`：** 在某个节点前暂停，检查当前状态
+- **流式输出：** `graph.stream(inputs, stream_mode="updates")` 观察每个节点的状态更新
+## 第二部分：Runnable — 万物皆可管道
+
+**核心问题：** 为什么 `prompt | model | parser` 能工作？这个 `|` 到底做了什么？
+
+### 1. 设计问题：统一执行模型
+
+LangChain里有太多可执行的东西：Prompt模板、模型调用、输出解析器、工具函数……它们的输入输出类型不同，执行方式不同。怎么让它们能随意组合？
+
+**设计答案：** 抽象出一个 `Runnable[Input, Output]` 基类，规定所有可执行单元都必须实现 `invoke(input) -> output`。
+
+```python
+class Runnable(ABC, Generic[Input, Output]):
+    @abstractmethod
+    def invoke(self, input: Input, config: RunnableConfig | None = None) -> Output:
+        """Transform a single input into an output."""
+```
+
+### 2. 为什么用泛型 `Generic[Input, Output]`？
+
+**类型安全组合：** 泛型让类型检查器能验证管道是否合法。
+
+```python
+prompt: Runnable[str, PromptValue]           # 输入字符串，输出PromptValue
+model: Runnable[PromptValue, AIMessage]      # 输入PromptValue，输出AIMessage
+parser: Runnable[AIMessage, dict]            # 输入AIMessage，输出dict
+
+chain = prompt | model | parser              # 类型检查器验证：str → PromptValue → AIMessage → dict ✓
+```
+
+如果管道中间断了（比如 `model` 的输出类型和 `parser` 的输入类型不匹配），类型检查器会报错。
+
+**逆变/协变：** Input是逆变的（消费端可以接受更宽的类型），Output是协变的（生产端可以返回更窄的类型）。这确保了子类型关系在组合时保持正确。
+
+### 3. `|` 操作符的魔法
+
+当你写 `prompt | model` 时，Python调用 `prompt.__or__(model)`，实际执行：
+
+```python
+def __or__(self, other):
+    return RunnableSequence(self, coerce_to_runnable(other))
+```
+
+**关键在 `coerce_to_runnable`：** 它能把普通函数自动包装成 `RunnableLambda`。所以你甚至可以写：
+
+```python
+chain = prompt | model | (lambda x: x.content.upper())
+```
+
+lambda函数被自动包装成 `RunnableLambda`，成为管道的一环。
+
+**扁平化优化：** 如果 `other` 已经是 `RunnableSequence`，不会创建嵌套序列，而是把步骤合并：
+
+```python
+# 不会变成 RunnableSequence(RunnableSequence(a, b), c)
+# 而是变成 RunnableSequence(a, b, c)
+```
+
+这避免了不必要的嵌套，保持管道结构扁平。
+
+### 4. RunnableSequence 的执行逻辑
+
+`RunnableSequence` 是管道的内部表示。它存储三个部分：`first`（第一个Runnable）、`middle`（中间的Runnable列表）、`last`（最后一个Runnable）。
+
+执行时，按顺序调用每个step，前一个的输出是后一个的输入：
+
+```python
+def invoke(self, input, config=None, **kwargs):
+    config = ensure_config(config)
+    callback_manager = get_callback_manager_for_config(config)
+    run_manager = callback_manager.on_chain_start(None, input)
+  
+    input_ = input
+    for i, step in enumerate(self.steps):
+        config = patch_config(config, callbacks=run_manager.get_child(...))
+        input_ = step.invoke(input_, config)
+  
+    run_manager.on_chain_end(input_)
+    return input_
+```
+
+**设计要点：**
+
+- 每一步的输出是下一步的输入（纯函数式管道）
+- 每一步都有独立的回调管理器（支持追踪和调试）
+- 配置通过 `patch_config` 为每一步修补（子运行继承父运行的配置，但可以覆盖）
+
+### 5. 四种执行模式的关系
+
+```
+invoke(input)      → 单个输入 → 单个输出（同步）
+ainvoke(input)     → 单个输入 → 单个输出（异步，默认用线程池包装invoke）
+batch([inputs])    → 多个输入 → 多个输出（线程池并行，默认实现）
+stream(input)      → 单个输入 → 输出流（默认实现只是yield invoke的结果，子类覆盖）
+```
+
+**为什么 `ainvoke` 默认用线程池？** 因为大多数子类只需要实现同步版本，自动获得异步支持。只有真正需要原生异步的子类（如HTTP客户端）才覆盖 `ainvoke`。这大大降低了实现新Runnable的门槛。
+
+**batch 的默认实现：** 用线程池并行执行多个invoke。单输入时有优化——直接调用invoke，不启动线程池。
+
+### 6. 配置如何在管道中传递？
+
+`RunnableConfig` 是一个字典，包含 `callbacks`、`tags`、`metadata`、`run_name` 等。它通过两种机制传递：
+
+- **显式传递：** 每个 `invoke` 调用都接收 `config` 参数
+- **隐式传播：** 通过 `ContextVar`（Python的上下文变量），配置自动在异步调用链中传播
+
+`ensure_config` 确保config不为None，`patch_config` 为子运行创建修改后的副本（不可变模式）。
+
+**为什么用ContextVar？** 因为异步代码中，配置需要跨越 `await` 边界传播。普通的函数参数传递在异步场景下不够用，ContextVar是Python标准库提供的上下文传播机制。
+
+## 第五部分：消息系统 — 为什么不用字典？
+
+**核心问题：** 直接用 `{"role": "user", "content": "Hello"}` 不行吗？为什么要设计一套消息类？
+
+### 1. 设计问题：消息的多样性
+
+不同Provider的消息格式差异巨大：
+
+- OpenAI: `{"role": "user", "content": "Hello"}`
+- Anthropic: `{"role": "user", "content": [{"type": "text", "text": "Hello"}]}`
+- 消息可能包含：文本、图片、工具调用、工具结果、推理过程……
+
+**设计答案：** 用类型化的消息类统一表示，每个Provider在边界处做格式转换。
+
+### 2. BaseMessage 的字段设计
+
+```python
+class BaseMessage(Serializable):
+    content: str | list[str | dict]  # 支持多模态（文本、图片、JSON等）
+    additional_kwargs: dict = {}     # Provider特定数据
+    response_metadata: dict = {}     # 响应元数据
+    type: str                        # 消息类型标识
+    name: str | None = None          # 可选名称
+    id: str | None = None            # 唯一标识
+```
+
+**每个字段的设计意图：**
+
+- **`content` 支持 `str | list[str | dict]`：** 因为多模态消息的content是一个内容块列表。纯文本消息的content是字符串，但包含图片的消息的content是 `[{"type": "text", "text": "..."}, {"type": "image_url", "image_url": {...}}]`
+- **`additional_kwargs`：** 存放Provider特定字段，避免基类字段无限膨胀。比如OpenAI的 `function_call` 字段就存在这里
+- **`response_metadata`：** 存放响应元数据（token用量、模型名等），不参与序列化和缓存
+- **`type`：** 让反序列化时能恢复正确的消息类型。`"human"` → `HumanMessage`，`"ai"` → `AIMessage`
+- **`id`：** Provider生成的消息唯一标识，用于去重和追踪
+
+### 3. 消息类型体系
+
+```
+BaseMessage
+    ├── HumanMessage    (type="human")   — 用户输入
+    ├── AIMessage       (type="ai")      — 模型输出
+    ├── SystemMessage   (type="system")  — 系统提示
+    └── ToolMessage     (type="tool")    — 工具执行结果
+```
+
+**AIMessage 的特殊字段：**
+
+```python
+class AIMessage(BaseMessage):
+    tool_calls: list[ToolCall] = []         # 模型发起的工具调用请求
+    invalid_tool_calls: list[...] = []      # 解析失败的工具调用
+    usage_metadata: UsageMetadata | None    # token使用统计
+```
+
+**为什么tool_calls放在AIMessage上？** 因为工具调用请求是模型输出的一部分。模型说"我要调用get_weather函数"，这个声明和"今天天气很好"一样，都是模型的输出内容。它们不应该分开存储。
+
+**ToolMessage 的设计：**
+
+```python
+class ToolMessage(BaseMessage):
+    tool_call_id: str  # 对应哪个tool_call
+```
+
+工具执行结果需要关联到发起调用的AIMessage。`tool_call_id` 就是这个关联键。
+
+### 4. 消息和PromptValue为什么要分开？
+
+- **`BaseMessage`：** 对话历史的一个单元（"用户说了什么"、"模型回了什么"）
+- **`PromptValue`：** 模型输入的最终形态（可以直接传给模型API）
+
+**为什么要分两层？** 因为Prompt模板需要处理变量填充。`PromptTemplate("你好，{name}")` 填充后产生 `StringPromptValue`，然后转换成 `[HumanMessage("你好，小明")]` 传给模型。PromptValue是中间形态，负责"从模板到消息"的转换。
+
+**职责分离：** Prompt模板负责变量填充，PromptValue负责格式转换，消息类负责结构化表示。每层只做一件事。
+
+### 5. Serializable 基类的作用
+
+BaseMessage继承自 `Serializable`，这意味着所有消息都支持：
+
+- **JSON序列化/反序列化：** 可以把消息存到数据库或文件
+- **类型恢复：** 反序列化时能根据 `type` 字段恢复成正确的消息子类
+- **Pydantic验证：** 字段赋值时自动验证类型
+
+## 第六部分：工具系统 — 函数如何变成模型能调用的工具？
+
+**核心问题：** `@tool` 装饰器到底做了什么？为什么要把一个函数包装成类？
+
+### 1. 设计问题：模型需要什么格式的工具？
+
+OpenAI的工具调用格式：
+
+```json
+{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "获取天气信息",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "城市名"}
+            },
+            "required": ["city"]
+        }
+    }
+}
+```
+
+模型需要三样东西：**函数名**、**描述**、**参数的JSON Schema**。普通Python函数没有这些元数据。
+
+### 2. @tool 装饰器的三步转换
+
+```python
+@tool
+def get_weather(city: str) -> str:
+    """获取天气信息"""
+    return f"{city}晴天"
+```
+
+装饰器做了三件事：
+
+1. **从函数签名推断参数Schema：** 用Pydantic的 `validate_arguments` 分析 `city: str`，生成JSON Schema `{"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}`
+2. **从docstring提取描述：** 解析 `"""获取天气信息"""` 作为工具描述
+3. **包装成StructuredTool类：** 把函数、name、description、args_schema打包成一个对象
+
+### 3. 为什么要把函数包装成类？
+
+- **Schema生成：** Pydantic需要类结构来生成参数验证schema。模型返回的工具调用参数是JSON，需要验证是否符合schema
+- **元数据存储：** name、description、return_direct等属性需要有地方存放
+- **统一接口：** 工具需要 `invoke`/`stream`/`batch` 方法，才能和其他Runnable组合
+- **错误处理：** 工具执行可能失败，需要统一的错误处理机制（`handle_tool_error`）
+
+### 4. BaseTool 为什么继承 Runnable？
+
+```python
+class BaseTool(RunnableSerializable[str | dict | ToolCall, Any]):
+```
+
+因为工具需要参与管道组合。Agent的执行流程是：
+
+```
+用户消息 → 模型 → (有tool_calls?) → 执行工具 → 把结果喂回模型 → ...
+```
+
+工具必须是Runnable，才能被放进这个循环里。它和Prompt、模型一样，都是管道中的一个环节。
+
+**输入类型 `str | dict | ToolCall`：** 工具可以接收字符串、字典或结构化的ToolCall对象。输出类型是 `Any`，因为工具可以返回任何东西。
+
+### 5. bind_tools 的不可变设计
+
+```python
+model.bind_tools([get_weather])
+# 返回一个新对象，原model不变
+```
+
+**为什么要返回新对象？** 不可变设计的好处：
+
+- 原模型可以被多个地方共享，不会互相干扰
+- 绑定tools的模型可以继续组合（如 `.with_retry()`、`.with_config()`）
+- 每次bind都是独立的配置快照
+
+**内部实现：** `bind_tools` 把工具转换成OpenAI格式的JSON Schema，然后调用 `self.bind(tools=formatted_tools)`，返回一个 `RunnableBinding`。`RunnableBinding` 是一个包装器，在invoke时把绑定的参数传给内部的Runnable。
+
+## 第七部分：Agent — 有状态的循环执行
+
+**核心问题：** Agent为什么用状态图（StateGraph）而不是简单的循环？
+
+### 1. 设计问题：Agent的执行不是线性的
+
+普通管道是线性的：`输入 → A → B → C → 输出`。但Agent的执行是循环的：
+
+```
+用户消息 → 模型思考 → 调用工具 → 拿到结果 → 模型再思考 → 可能再调工具 → ... → 最终回答
+```
+
+**设计答案：** 用状态图（StateGraph）表示这个循环。
+
+### 2. AgentState 的设计
+
+```python
+class AgentState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+    jump_to: Annotated[JumpTo | None, EphemeralValue]
+    structured_response: Annotated[ResponseT, OmitFromInput]
+```
+
+**为什么用TypedDict？** 因为LangGraph的StateGraph要求state schema是TypedDict。TypedDict是Python原生的类型化字典，既轻量又支持类型检查。
+
+**Reducer注解是什么？**
+
+```python
+messages: Annotated[list[AnyMessage], add_messages]
+```
+
+`add_messages` 是一个reducer函数，它告诉StateGraph：当新状态包含messages时，不是替换整个列表，而是追加到现有列表。这样每次模型调用、工具执行产生的新消息都会被累加到对话历史中。
+
+**为什么需要reducer？** 因为图的每个节点返回的是"增量状态"，不是"完整状态"。节点返回 `{"messages": [new_message]}`，reducer负责把它合并到现有状态里。
+
+**EphemeralValue是什么？** `jump_to` 字段用 `EphemeralValue` 注解，表示这个值只在当前步骤有效，不会累积。每次节点执行后自动清空。
+
+### 3. create_agent 的图构建
+
+```python
+def create_agent(model, tools, middleware, ...):
+    graph = StateGraph(state_schema=AgentState)
+  
+    # 添加节点
+    graph.add_node("model", _call_model)
+    graph.add_node("tools", ToolNode(tools))
+  
+    # 添加边
+    graph.add_edge(START, "model")
+    graph.add_conditional_edges("model", should_continue)  # 有tool_calls→tools，否则→END
+    graph.add_edge("tools", "model")
+  
+    return graph.compile()
+```
+
+**执行流程：**
+
+1. START → model：把用户消息喂给模型
+2. model → 判断：模型返回的AIMessage有tool_calls吗？
+   - 有 → tools：执行工具，产生ToolMessage
+   - 没有 → END：返回最终回答
+3. tools → model：把工具结果喂回模型，回到步骤2
+
+**为什么用图而不是while循环？**
+
+- **持久化：** StateGraph支持checkpointer，可以把状态保存到数据库，实现对话历史持久化。对话断了可以恢复
+- **Human-in-the-loop：** 支持 `interrupt_before`/`interrupt_after`，在执行到某个节点前暂停等待人类输入（比如确认是否执行危险操作）
+- **组合性：** StateGraph可以作为子图嵌入更大的图（多Agent系统）
+- **可视化：** 图结构天然支持可视化调试
+
+### 4. Middleware 的三种钩子
+
+```python
+class AgentMiddleware:
+    def before_model(self, state, runtime):
+        """模型调用前执行，可修改状态（如注入系统提示）"""
+  
+    def after_model(self, state, runtime):
+        """模型调用后执行，可修改状态（如过滤响应）"""
+  
+    def wrap_model_call(self, request, handler):
+        """包裹模型调用，完全控制执行（如重试、短路、修改请求）"""
+```
+
+**为什么需要三种？** 能力递进：
+
+- **`before/after`：** 只能观察和修改状态，不能阻断流程。适合"注入系统提示"、"记录日志"等场景
+- **`wrap`：** 完全控制执行——可以修改请求、短路返回、重试、修改响应。适合"重试逻辑"、"请求/响应转换"等场景
+
+**多个wrap的组合方式：** 洋葱模型。假设middleware A和B都有wrap：
+
+```
+A.wrap(request, → B.wrap(request, → 真正的模型调用))
+```
+
+A是外层，B是内层。A可以在调用B之前修改request，B返回后A可以修改response。这和Express.js的中间件、Python的装饰器是同一个模式。
+
+**不可变的request：** `ModelRequest` 的属性不能直接修改（会发出废弃警告），需要用 `request.override(...)` 创建新实例。这确保了middleware之间不会互相干扰。
+
+
+### 4.1 模板方法模式
+
+**定义**：在基类中定义算法骨架，子类实现具体步骤。
+
+**LangChain 应用**：
+
+| 位置                               | 基类              | 模板方法                                | 子类实现                       |
+| ---------------------------------- | ----------------- | --------------------------------------- | ------------------------------ |
+| `runnables/base.py`              | `Runnable`      | `invoke()`, `batch()`, `stream()` | 子类实现 `_call()`           |
+| `language_models/chat_models.py` | `BaseChatModel` | `generate()`                          | `_generate()`, `_stream()` |
+| `tools/base.py`                  | `BaseTool`      | `run()`                               | `_run()`                     |
+| `chains/base.py`                 | `Chain`         | `invoke()`                            | `_call()`                    |
+
+### 4.2 策略模式
+
+**定义**：定义一系列算法，让客户端动态选择。
+
+**LangChain 应用**：
+
+| 位置                               | 策略接口                         | 具体策略                              |
+| ---------------------------------- | -------------------------------- | ------------------------------------- |
+| `language_models/chat_models.py` | `_should_stream()`             | 流式 vs 非流式                        |
+| `agents/`                        | `BaseSingleActionAgent.plan()` | ReAct, OpenAI Functions, Tool Calling |
+| `chains/combine_documents/`      | `combine_docs()`               | Stuff, MapReduce, Refine              |
+
+### 4.3 组合模式
+
+**定义**：将对象组合成树形结构，统一处理单个对象和组合对象。
+
+**LangChain 应用**：
+
+| 位置                     | 组合类               | 子组件                          |
+| ------------------------ | -------------------- | ------------------------------- |
+| `runnables/base.py`    | `RunnableSequence` | `first`, `middle`, `last` |
+| `runnables/base.py`    | `RunnableParallel` | `steps: dict[str, Runnable]`  |
+| `chains/sequential.py` | `SequentialChain`  | `chains: list[Chain]`         |
+
+### 4.4 观察者模式
+
+**定义**：定义对象间的一对多依赖，当对象状态改变时通知所有依赖者。
+
+**LangChain 应用**：
+
+| 位置                     | Subject             | Observer                | 事件                                  |
+| ------------------------ | ------------------- | ----------------------- | ------------------------------------- |
+| `callbacks/manager.py` | `CallbackManager` | `BaseCallbackHandler` | `on_llm_start`, `on_llm_end`, ... |
+
+### 4.5 责任链模式
+
+**定义**：让请求沿着链传递，直到有对象处理它。
+
+**LangChain 应用**：
+
+| 位置                     | 链实现                                     |
+| ------------------------ | ------------------------------------------ |
+| `runnables/base.py`    | `RunnableSequence` - 顺序执行            |
+| `chains/sequential.py` | `SequentialChain` - 链式处理             |
+| `agents/agent.py`      | Agent 循环 - plan → action → observation |
+
+### 4.6 装饰器模式
+
+**定义**：动态给对象添加额外职责。
+
+**LangChain 应用**：
+
+| 位置                       | 装饰器                    | 作用                |
+| -------------------------- | ------------------------- | ------------------- |
+| `runnables/base.py`      | `RunnableBinding`       | 绑定 kwargs, config |
+| `runnables/base.py`      | `RunnableRetry`         | 添加重试机制        |
+| `runnables/fallbacks.py` | `RunnableWithFallbacks` | 添加降级机制        |
+| `tools/convert.py`       | `@tool`                 | 函数 → Tool        |
+
+### 4.7 工厂方法模式
+
+**定义**：定义创建对象的接口，让子类决定实例化哪个类。
+
+**LangChain 应用**：
+
+| 位置                                  | 工厂方法                           |
+| ------------------------------------- | ---------------------------------- |
+| `runnables/base.py`                 | `coerce_to_runnable()`           |
+| `tools/structured.py`               | `StructuredTool.from_function()` |
+| `chains/combine_documents/stuff.py` | `create_stuff_documents_chain()` |
+
+
+## 5. 扩展机制
+
+### 5.1 自定义 Tool
+
+```python
+from langchain_core.tools import BaseTool, tool
+from pydantic import BaseModel
+
+# 方式1: 使用 @tool 装饰器（推荐）
+@tool
+def my_tool(query: str, limit: int = 10) -> str:
+    """Search for documents matching the query.
+
+    Args:
+        query: The search query string.
+        limit: Maximum number of results to return.
+    """
+    return f"Found {limit} results for '{query}'"
+
+# 方式2: 继承 BaseTool
+class MyTool(BaseTool):
+    name: str = "my_tool"
+    description: str = "Search for documents"
+
+    class InputSchema(BaseModel):
+        query: str
+        limit: int = 10
+
+    args_schema: Type[BaseModel] = InputSchema
+
+    def _run(self, query: str, limit: int = 10) -> str:
+        return f"Found {limit} results for '{query}'"
+
+    async def _arun(self, query: str, limit: int = 10) -> str:
+        return self._run(query, limit)
+```
+
+### 5.2 自定义 Chain（LCEL 风格）
+
+```python
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda, chain
+
+# 方式1: 使用 LCEL 组合
+chain = (
+    RunnablePassthrough.assign(
+        context=lambda x: retriever.invoke(x["query"]),
+        history=lambda x: get_history(x["session_id"])
+    )
+    | prompt
+    | llm
+    | output_parser
+)
+
+# 方式2: 使用 @chain 装饰器
+@chain
+def my_chain(input: dict) -> str:
+    query = input["query"]
+    docs = retriever.invoke(query)
+    context = "\n".join(d.page_content for d in docs)
+    return (prompt | llm | parser).invoke({"context": context, "query": query})
+```
+
+### 5.3 自定义 Agent
+
+```python
+from langchain.agents import create_tool_calling_agent, AgentExecutor
+
+# 方式1: 使用 create_tool_calling_agent（推荐）
+agent = create_tool_calling_agent(llm, tools, prompt)
+agent_executor = AgentExecutor(agent=agent, tools=tools)
+
+# 方式2: 自定义 Agent 类
+from langchain.agents import BaseSingleActionAgent
+
+class MyAgent(BaseSingleActionAgent):
+    llm: BaseLanguageModel
+    tools: list[BaseTool]
+
+    @property
+    def input_keys(self) -> list[str]:
+        return ["input"]
+
+    def plan(
+        self,
+        intermediate_steps: list[tuple[AgentAction, str]],
+        **kwargs
+    ) -> AgentAction | AgentFinish:
+        # 实现规划逻辑
+        ...
+```
+
+### 5.4 自定义回调处理器
+
+```python
+from langchain_core.callbacks import BaseCallbackHandler
+
+class MyCallbackHandler(BaseCallbackHandler):
+    def on_llm_start(self, serialized, prompts, **kwargs):
+        print(f"LLM started with {len(prompts)} prompts")
+
+    def on_llm_new_token(self, token, **kwargs):
+        print(f"New token: {token}")
+
+    def on_llm_end(self, response, **kwargs):
+        print(f"LLM ended: {response}")
+
+    def on_chain_start(self, serialized, inputs, **kwargs):
+        print(f"Chain started: {inputs}")
+
+    def on_tool_start(self, serialized, tool_input, **kwargs):
+        print(f"Tool started: {tool_input}")
+
+# 使用
+llm = ChatOpenAI(callbacks=[MyCallbackHandler()])
+```
+
+---
+
+## 6. 关键 Python 特性使用
+
+### 6.1 抽象基类 (ABC)
+
+```python
+# runnables/base.py
+from abc import ABC, abstractmethod
+
+class Runnable(ABC, Generic[Input, Output]):
+    @abstractmethod
+    def invoke(self, input: Input, config: ...) -> Output:
+        """子类必须实现"""
+```
+
+### 6.2 泛型 (Generic, TypeVar)
+
+```python
+# runnables/base.py
+from typing import TypeVar, Generic
+
+Input = TypeVar("Input", contravariant=True)
+Output = TypeVar("Output", covariant=True)
+
+class Runnable(ABC, Generic[Input, Output]):
+    def invoke(self, input: Input) -> Output: ...
+```
+
+### 6.3 ContextVar
+
+```python
+# runnables/config.py
+from contextvars import ContextVar
+
+var_child_runnable_config: ContextVar[RunnableConfig | None] = ContextVar(
+    "child_runnable_config", default=None
+)
+
+# 设置配置
+token = var_child_runnable_config.set(config)
+
+# 子调用自动继承
+child_config = var_child_runnable_config.get()
+```
+
+### 6.4 Pydantic 模型
+
+```python
+# messages/base.py
+from pydantic import BaseModel
+
+class BaseMessage(Serializable):
+    content: str | list[str | dict]
+    type: str
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        # 自定义验证
+        return self
+```
+
+### 6.5 异步支持
+
+```python
+# language_models/chat_models.py
+class BaseChatModel:
+    # 同步版本
+    def invoke(self, input, config) -> AIMessage: ...
+    def stream(self, input, config) -> Iterator[AIMessageChunk]: ...
+
+    # 异步版本
+    async def ainvoke(self, input, config) -> AIMessage: ...
+    async def astream(self, input, config) -> AsyncIterator[AIMessageChunk]: ...
+```
+
+### 6.6 操作符重载
+
+```python
+# runnables/base.py
+class Runnable:
+    def __or__(self, other: RunnableLike) -> RunnableSequence:
+        """self | other → RunnableSequence"""
+        return RunnableSequence(self, coerce_to_runnable(other))
+```
+
+### 6.7 functools 工具
+
+```python
+# 缓存属性
+from functools import cached_property
+
+class BaseChatModel:
+    @cached_property
+    def _serialized(self) -> dict:
+        return dumpd(self)
+
+# LRU 缓存
+from functools import lru_cache
+
+@lru_cache(maxsize=256)
+def get_function_nonlocals(func: Callable) -> list[Any]:
+    ...
+```
+
+---
+
+## 7. 设计亮点与值得学习的地方
+
+### 7.1 统一的调用协议
+
+**亮点**：所有组件都是 `Runnable`，具有一致的 `invoke/batch/stream` 接口。
+
+**好处**：
+
+- 用户无需学习不同组件的调用方式
+- 组件可自由组合，自动继承能力
+- 类型安全，IDE 自动补全友好
+
+### 7.2 声明式组合语法
+
+**亮点**：使用 `|` 操作符实现声明式组合。
+
+```python
+chain = prompt | llm | parser
+```
+
+**好处**：
+
+- 代码简洁，可读性强
+- 组合关系一目了然
+- 自动获得同步/异步/批处理/流式能力
+
+### 7.3 清晰的分层架构
+
+**亮点**：core → classic → partners 三层分离。
+
+**好处**：
+
+- 核心抽象稳定，不依赖第三方
+- 实现层可独立演进
+- 第三方集成隔离，降低维护成本
+
+### 7.4 完善的回调系统
+
+**亮点**：统一的回调机制支持日志、追踪、监控。
+
+**好处**：
+
+- 无侵入式观测
+- 与 LangSmith 深度集成
+- 支持自定义扩展
+
+### 7.5 类型安全设计
+
+**亮点**：大量使用泛型、Literal、Protocol 等类型特性。
+
+**好处**：
+
+- IDE 自动补全友好
+- 静态类型检查支持
+- 文档即类型
+
+
+## 第二部分：设计模式背后的思维
+
+### 2.1 模板方法模式
+
+**一个与框架无关的例子**：
+
+你开了一家快递公司。寄件流程是固定的：
+
+1. 收件 → 2. 验视 → 3. 称重 → 4. 计费 → 5. 发货
+
+但「计费」这一步，不同快递公司算法不同（顺丰按重量，京东按体积）。流程骨架固定，只有计费策略变化。
+
+**本质问题**：当你有一个固定的流程骨架，但某些步骤的具体实现需要变化时，如何避免重复写流程代码？
+
+**LangChain 里的具体场景**：
+
+`BaseChatModel.invoke()` 定义了调用 LLM 的骨架：准备配置 → 触发回调 → 检查缓存 → 限流 → 判断流式 → 调用子类 `_generate()` → 更新缓存 → 触发结束回调。
+
+只有 `_generate()` 这一步需要子类实现（OpenAI 调 OpenAI API，Anthropic 调 Anthropic API）。
+
+**源码证据**：`chat_models.py` 第 1767-1810 行的 `_generate_with_cache` 方法。
+
+**什么时候用，什么时候不用**：
+
+✅ 流程固定，只有某些步骤变化
+✅ 想控制扩展点（子类只能改特定方法）
+❌ 流程本身需要变化
+❌ 步骤之间没有固定顺序
+
+**记忆锚点**：「骨架固定，血肉可换」——`BaseChatModel._generate_with_cache()` 定义骨架，子类 `_generate()` 填充血肉。
+
+---
+
+### 2.2 策略模式
+
+**一个与框架无关的例子**：
+
+你去旅游，目的地是北京。可以选择飞机、高铁、自驾。目的地相同，但出行策略不同。你不需要为每种交通方式写一套旅游计划。
+
+**本质问题**：当你有多种方式完成同一件事，需要在运行时选择用哪种方式。
+
+**LangChain 里的具体场景**：
+
+`BaseChatModel._should_stream()` 方法决定是否使用流式输出。它有三种策略：
+
+1. 检查子类是否实现了 `_stream()` 方法
+2. 检查用户是否显式设置了 `stream=True`
+3. 检查是否有流式回调处理器
+
+**源码证据**：`chat_models.py` 第 1844-1848 行。
+
+**什么时候用，什么时候不用**：
+
+✅ 有多种算法/行为可以互换
+✅ 需要在运行时选择
+✅ 想避免大量的 if-else
+❌ 只有一种实现方式
+❌ 算法之间不能互换
+
+**记忆锚点**：「条条大路通罗马，运行时选哪条」——`_should_stream()` 在运行时选择流式或非流式。
+
+---
+
+### 2.3 组合模式
+
+**一个与框架无关的例子**：
+
+文件系统。文件夹可以包含文件，也可以包含子文件夹。你用同样的方式对待文件和文件夹——都可以删除、移动、重命名。你不需要区分「删除文件」和「删除文件夹」是两种操作。
+
+**本质问题**：当你需要处理树形结构，希望单个对象和组合对象有一致的操作方式。
+
+**LangChain 里的具体场景**：
+
+`RunnableSequence` 包含多个 Runnable，但 `RunnableSequence` 本身也是一个 Runnable。你可以把一个 `RunnableSequence` 作为另一个 `RunnableSequence` 的一个步骤。
+
+```python
+inner = prompt | llm                    # RunnableSequence
+outer = inner | parser | validator      # RunnableSequence 包含 RunnableSequence
+```
+
+`outer.invoke(input)` 和 `inner.invoke(input)` 用同样的方式调用。
+
+**源码证据**：`base.py` 第 2861 行的 `RunnableSequence` 类。
+
+**什么时候用，什么时候不用**：
+
+✅ 有树形或层次结构
+✅ 想统一处理单个对象和组合对象
+❌ 结构扁平
+❌ 单个对象和组合对象行为差异很大
+
+**记忆锚点**：「单兵和军团，同一种命令」——`RunnableSequence` 和 `Runnable` 都用 `invoke()` 调用。
+
+---
+
+### 2.4 观察者模式
+
+**一个与框架无关的例子**：
+
+YouTube 频道。你订阅了一个频道，当频道发布新视频时，你会收到通知。频道不需要知道你是谁，只需要通知所有订阅者。你也可以随时取消订阅。
+
+**本质问题**：当对象状态变化时，需要通知多个依赖对象，但不想让主体和观察者紧耦合。
+
+**LangChain 里的具体场景**：
+
+LLM 开始调用时，需要通知所有回调处理器（日志、追踪、监控）。LLM 不知道有哪些处理器，也不关心它们做什么。
+
+```python
+# manager.py
+def handle_event(handlers, event_name, ...):
+    for handler in handlers:
+        getattr(handler, event_name)(*args, **kwargs)
+```
+
+**源码证据**：`callbacks/manager.py` 的 `handle_event` 函数。
+
+**什么时候用，什么时候不用**：
+
+✅ 一个对象变化需要通知多个对象
+✅ 通知者和被通知者需要解耦
+✅ 观察者数量可能变化
+❌ 只有一个观察者（直接调用更简单）
+❌ 性能敏感场景（通知有开销）
+
+**记忆锚点**：「广播通知，谁听谁处理」——`handle_event()` 遍历所有 handler，调用对应方法。
+
+---
+
+### 2.5 装饰器模式
+
+**一个与框架无关的例子**：
+
+你买咖啡，可以加糖、加奶、加奶油。每加一层，咖啡就多一个特性，但核心还是咖啡。你不需要为「加糖的咖啡」「加奶的咖啡」各写一个类。
+
+**本质问题**：想动态给对象添加功能，但不改变对象本身。
+
+**LangChain 里的具体场景**：
+
+`llm.bind(stop=["\n"])` 返回一个 `RunnableBinding`，它包装了原 LLM，调用时自动带上 `stop` 参数。原 LLM 没有被修改。
+
+**源码证据**：`base.py` 第 622-641 行的 `__or__` 方法内部调用 `coerce_to_runnable`，`RunnableBinding` 包装原 Runnable。
+
+**什么时候用，什么时候不用**：
+
+✅ 需要动态添加功能
+✅ 功能可以叠加
+✅ 不想修改原类
+❌ 功能固定不变
+❌ 只有一种配置
+
+**记忆锚点**：「包装再包装，功能层层加」——`llm.bind(stop=["\n"])` 包装原 LLM，添加 stop 参数。
+
+---
+
+### 2.6 工厂方法模式
+
+**一个与框架无关的例子**：
+
+你是一个餐厅经理，需要招聘厨师。你不需要知道具体是中餐厨师还是西餐厨师，你只需要说「我需要一个厨师」，招聘平台会给你合适的厨师。
+
+**本质问题**：创建对象的逻辑复杂，或者创建哪个类需要运行时决定。
+
+**LangChain 里的具体场景**：
+
+`coerce_to_runnable()` 把各种类型（函数、dict、生成器）统一转成 Runnable。用户不需要知道 `RunnableLambda`、`RunnableParallel`、`RunnableGenerator` 的存在。
+
+**源码证据**：`base.py` 第 6257-6277 行。
+
+```python
+def coerce_to_runnable(thing):
+    if isinstance(thing, Runnable): return thing
+    if callable(thing): return RunnableLambda(thing)
+    if isinstance(thing, dict): return RunnableParallel(thing)
+```
+
+**什么时候用，什么时候不用**：
+
+✅ 创建逻辑复杂
+✅ 需要根据条件创建不同类
+✅ 想隐藏创建细节
+❌ 创建逻辑简单
+❌ 只有一种类
+
+**记忆锚点**：「给我原料，工厂给你成品」——`coerce_to_runnable()` 接收函数/dict，返回 Runnable。
+
+---
+
+## 第三部分：举一反三，迁移到其他场景
+
+### 3.1 可复用的设计思路
+
+#### 思路1：统一抽象 + 自动能力继承
+
+**LangChain 做法**：所有组件都是 Runnable，实现 `_call()` 一个方法，自动获得 batch/stream/async。
+
+**可迁移场景**：
+
+1. **数据处理管道**：定义 `Processor[Input, Output]` 基类，实现 `process()` 一个方法，自动获得 `batch_process()`、`stream_process()`、`async_process()`。
+2. **API 网关**：定义 `Handler` 基类，实现 `handle()` 一个方法，自动获得 `with_auth()`、`with_rate_limit()`、`with_retry()`。
+3. **插件系统**：定义 `Plugin` 基类，实现 `execute()` 一个方法，自动获得 `before_hook()`、`after_hook()`、`fallback()`。
+
+**核心公式**：`实现一个方法 → 自动获得 N 种调用方式`
+
+---
+
+#### 思路2：声明式组合
+
+**LangChain 做法**：用 `|` 操作符组合组件。
+
+**可迁移场景**：
+
+1. **数据处理管道**：`pipeline = read_csv | filter_nulls | transform | write_parquet`
+2. **中间件链**：`app = logging | auth | rate_limit | handler`
+3. **图像处理**：`process = load_image | resize(224) | normalize | save("out.jpg")`
+
+**核心公式**：`a | b | c` 比 `Sequence([a, b, c])` 更直观
+
+---
+
+#### 思路3：配置隐式传递
+
+**LangChain 做法**：用 ContextVar 传递配置，子调用自动继承父配置。
+
+**可迁移场景**：
+
+1. **分布式追踪**：`trace_id` 自动传递，不需要层层传参。
+2. **多租户系统**：`tenant_id` 自动传递，每个函数都能获取当前租户。
+3. **请求上下文**：`request_id`、`user_id` 自动传递，任何地方都能获取。
+
+**核心公式**：`ContextVar + ensure_config() = 隐式传递`
+
+---
+
+### 3.2 LangChain 特有的设计
+
+#### 设计1：消息类型细分
+
+**为什么是特有的**：LLM 领域特有。不同角色（Human/AI/Tool/System）有不同字段。其他领域可能不需要这么细的类型区分。
+
+**什么场景适用**：即时通讯系统（不同消息类型）、工作流系统（不同任务类型）、事件系统（不同事件类型）。
+
+#### 设计2：回调的 Mixin 分层
+
+**为什么是特有的**：LangChain 有多种组件（LLM、Chain、Tool、Retriever），每种组件有独立的事件。
+
+**什么场景适用**：有多种组件类型的系统，每种组件有独立的生命周期事件，用户可能只想监听部分事件。
+
+---
+
+### 3.3 设计数据处理管道的借鉴
+
+假设你要设计一个数据处理管道框架：
+
+**可以借鉴**：
+
+```python
+# 1. 统一抽象
+class Stage(ABC, Generic[Input, Output]):
+    @abstractmethod
+    def process(self, input: Input) -> Output: ...
+
+    def batch(self, inputs: list[Input]) -> list[Output]:
+        with ThreadPoolExecutor() as executor:
+            return list(executor.map(self.process, inputs))
+
+# 2. 声明式组合
+pipeline = read_csv | filter_rows | transform | write_parquet
+
+# 3. 配置隐式传递
+pipeline_context: ContextVar[PipelineConfig] = ContextVar("pipeline")
+
+# 4. 回调系统
+class PipelineHandler(ABC):
+    def on_stage_start(self, stage, input): ...
+    def on_stage_end(self, stage, output): ...
+```
+
+**不应该借鉴**：
+
+1. 消息类型细分：数据处理管道不需要 HumanMessage/AIMessage 这种细分
+2. Tool 抽象：数据处理管道不需要 Agent 调用工具的概念
+
+---
+
+## 第四部分：最终内化
+
+### 4.1 LangChain 作者的设计哲学（3 句话）
+
+1. **组合优于继承**：用 `|` 操作符组合组件，而不是继承链式调用。组件可以自由组合，组合后的链自动继承所有能力。
+2. **约定优于配置**：实现一个抽象方法 `_call()`，自动获得 batch/stream/async 六种调用方式。用户只需关注核心逻辑，框架自动补全能力。
+3. **抽象要足够通用**：Runnable 不只是 LLM 调用，它是「可组合的处理单元」。这个抽象让 Tool、Prompt、Parser 都能统一处理。
+
+---
+
+### 4.2 最重要的 3 个设计思维
+
+#### 思维1：统一抽象带来能力继承
+
+**一句话**：定义一个足够通用的抽象，让所有组件都能享受框架提供的能力。
+
+**记忆锚点**：「实现一个方法，自动获得六种调用方式」
+
+**源码位置**：`langchain_core/runnables/base.py` 第 128 行
+
+```python
+class Runnable(ABC, Generic[Input, Output]):
+    @abstractmethod
+    def invoke(self, input, config) -> Output: ...       # 你只实现这一个
+
+    def batch(self, inputs) -> list[Output]: ...          # 自动获得
+    def stream(self, input) -> Iterator[Output]: ...      # 自动获得
+    async def ainvoke(self, input) -> Output: ...         # 自动获得
+```
+
+---
+
+#### 思维2：声明式组合优于命令式组合
+
+**一句话**：用操作符或声明式语法组合组件，让代码像在描述「做什么」而不是「怎么做」。
+
+**记忆锚点**：`prompt | llm | parser` 比 `RunnableSequence([prompt, llm, parser])` 更直观
+
+**源码位置**：`langchain_core/runnables/base.py` 第 622 行
+
+```python
+def __or__(self, other) -> RunnableSequence:
+    return RunnableSequence(self, coerce_to_runnable(other))
+```
+
+---
+
+#### 思维3：隐式传递减少样板代码
+
+**一句话**：用 ContextVar 传递跨层依赖，让中间层不需要感知这些依赖。
+
+**记忆锚点**：「配置自动继承，不用层层传递」
+
+**源码位置**：`langchain_core/runnables/config.py` 第 166 行
+
+```python
+var_child_runnable_config: ContextVar[RunnableConfig | None] = ContextVar(
+    "child_runnable_config", default=None
+)
+```
+
+---
+
+### 4.3 一个月后还能记住的总结
+
+| 思维       | 一句话                                          | 典型代码位置                                    |
+| ---------- | ----------------------------------------------- | ----------------------------------------------- |
+| 统一抽象   | 实现一个方法，自动获得六种调用方式              | `Runnable.invoke()` → `batch/stream/async` |
+| 声明式组合 | `a \| b \| c` 比 `Sequence([a, b, c])` 更直观 | `__or__` 操作符                               |
+| 隐式传递   | 配置自动继承，不用层层传递                      | `ContextVar` + `ensure_config()`            |
+
+**最终记忆口诀**：
+
+> **统一抽象能力继，声明组合更清晰，隐式传递减样板。**
